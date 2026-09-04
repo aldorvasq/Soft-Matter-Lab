@@ -12,7 +12,7 @@ Research use is defined as any use of the software/scripts for academic, scienti
   - Using the software/scripts in experiments.
   - Using the software/scripts to analyze data for research publications.
 
-To request permission for commercial or research use, please contact Aldo Vasquez-Briceno at aldo.vasquezbriceno@utsa.edu.
+To request permission for commercial or research use, please contact Aldo Vasquez-Briceno at aldo.vasquezbriceno[at]utsa.edu.
 
 THE SOFTWARE/SCRIPTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE/SCRIPTS OR THE USE OR OTHER DEALINGS IN THE SOFTWARE/SCRIPTS.
 
