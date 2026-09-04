@@ -1,4 +1,4 @@
-Copyright (c) 2025, Aldo Vasquez-Briceno
+Copyright (c) 2026, Aldo Vasquez-Briceno
 All rights reserved.
 
 No rights are granted for commercial use, research use, or any other use of this software/these scripts without the express written permission of the copyright holder.
