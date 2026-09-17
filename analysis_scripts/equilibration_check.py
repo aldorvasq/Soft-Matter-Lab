@@ -6,54 +6,79 @@ import matplotlib.pyplot as plt
 from pymbar import timeseries
 import soft_matter as sm
 import MDAnalysis as mda
+import analysis_config as config
 from select_positions import idx_selection
 from timeseries import gtensor_timeseries, e2e_timeseries
 
 
-# -------------------------------------------------------------------------------------
-# STEP 1. Read the potential energy and the timestep out of the h5 file.
-# Same access pattern as Scripts/plot_quantities.py: open the file, then index the
-# dataset by its full path inside the file and take [:] to pull it into a numpy array.
-# -------------------------------------------------------------------------------------
-
-hdf5_input_file = 'thermodynamic_properties.h5'
-input_file = 'polymer_beads.gsd'  # GSD file containing the polymer system
-
-# ---- output settings, all in one place ------------------------------------------------
-output_file = 'structural_analysis.h5'   # everything the analysis produces
-gamma_output_file = 'interfacial_tension.h5'
-plot_folder = 'equilibration_plots'
-save_raw_segments = False   # the per-segment arrays are the bulk of the file
-make_plots = True
-
-# ---- what to run ----------------------------------------------------------------------
-run_structural = True    # the gyration tensor analyses, per bead type
-run_thermo = True        # the quantities logged by HOOMD, on their own clock
-
-# When detect_equilibration leaves t0 at the very start of a series that clearly has a
-# transient, fall back to cutting at the point the series first reaches its plateau.
-# See the note next to the fallback itself for why the heuristic fails this way.
-fix_uncut_transients = True
-start_offset_threshold = 5.0   # in units of the within-frame spread
-
-hdf5_file = h5py.File(name=hdf5_input_file, mode='r')
-timestep = hdf5_file['hoomd-data/Simulation/timestep'][:]
-potet = hdf5_file['/hoomd-data/md/compute/ThermodynamicQuantities/potential_energy'][:]
-pressure = hdf5_file['/hoomd-data/md/compute/ThermodynamicQuantities/pressure'][:]
-pressure_tensor = hdf5_file['/hoomd-data/md/compute/ThermodynamicQuantities/pressure_tensor'][:]
-hdf5_file.close()
-
-#  Polymer structural quantities
-polymer_system = mda.Universe(input_file) # Retrieve system from GSD file.
-box_dims = polymer_system.dimensions[0:3] # box dimensions in x, y, z
-n_frames = len(polymer_system.trajectory) # number of frames in the trajectory
+HOOMD_HDF5_DATASET_PATHS = {
+    'timestep': 'hoomd-data/Simulation/timestep',
+    'potential_energy':
+        'hoomd-data/md/compute/ThermodynamicQuantities/potential_energy',
+    'pressure':
+        'hoomd-data/md/compute/ThermodynamicQuantities/pressure',
+    'pressure_tensor':
+        'hoomd-data/md/compute/ThermodynamicQuantities/pressure_tensor',
+}
 
 
-# # List of bead types to compute quantities for. Can be any combination of the bead types in the system, or just one type, or 'all' for all beads.
-list_bead_types = ['A', 'B', 'C', 'A B C'] # you can also type two types ( 'A B' ) if you want to compute quantities for a specific combination of bead types.
+if not config.run_structural and not config.run_thermo:
+    raise ValueError("At least one of run_structural or run_thermo must be True.")
 
-list_length_of_polymer_segments = [5, 15, 60, 1260] # number of beads in a polymer segment, where segmet is backbone, sidechain, whole polymer, etc.
+thermo_data = {}
+thermo_source = None
+thermo_x_axis_label = 'Frame'
+if config.run_thermo:
+    if config.thermo_input_data:
+        thermo_data = {name: np.asarray(values)
+                       for name, values in config.thermo_input_data.items()}
+        thermo_source = 'thermo_input_data'
+    else:
+        dataset_paths = (config.hdf5_dataset_paths
+                         if config.hdf5_dataset_paths
+                         else HOOMD_HDF5_DATASET_PATHS)
+        if not config.hdf5_dataset_paths:
+            thermo_x_axis_label = 'Timestep'
+        with h5py.File(name=config.hdf5_input_file, mode='r') as hdf5_file:
+            thermo_data = {
+                name: hdf5_file[path][:]
+                for name, path in dataset_paths.items()
+            }
+        thermo_source = config.hdf5_input_file
 
+    if 'timestep' not in thermo_data:
+        raise ValueError("Thermodynamic input data must include a 'timestep' array.")
+
+timestep = np.asarray(thermo_data.get('timestep', []))
+if config.run_thermo and timestep.ndim != 1:
+    raise ValueError("'timestep' must be a one-dimensional array.")
+
+# Box lengths can be supplied manually when a trajectory format does not carry them.
+box_dims = None
+if config.box_dims is not None:
+    box_dims = np.asarray(config.box_dims, dtype=float)
+
+# Polymer structural quantities
+if config.run_structural:
+    polymer_system = mda.Universe(config.trajectory_file) # Retrieve the polymer system.
+    if box_dims is None:
+        trajectory_dims = polymer_system.dimensions
+        if trajectory_dims is not None:
+            box_dims = np.asarray(trajectory_dims[:3], dtype=float)
+    n_frames = len(polymer_system.trajectory) # number of frames in the trajectory
+else:
+    polymer_system = None
+    n_frames = 0
+
+if box_dims is not None:
+    if (box_dims.shape != (3,)
+            or not np.all(np.isfinite(box_dims))
+            or np.any(box_dims <= 0)):
+        raise ValueError("box_dims must contain three positive finite lengths: "
+                         "[Lx, Ly, Lz].")
+elif config.run_structural:
+    raise ValueError("No box dimensions were found in the trajectory. Set box_dims "
+                     "to [Lx, Ly, Lz] in analysis_config.py.")
 # Registry of the analyses that can be run. Each entry says which function does the
 # work, what that function needs as input, and what it gives back.
 #
@@ -78,9 +103,6 @@ analysis_registry = {
                     'returns': ('asphericity',)},
 }
 
-# Which of the above to actually run. Drop a name to skip that analysis.
-list_analyses = ['rg_components', 'shape_anisotropy', 'asphericity']
-
 # Inputs that do not vary per segment, passed to the analysis functions unchanged.
 constant_inputs = {'box': box_dims}
 
@@ -89,9 +111,6 @@ constant_inputs = {'box': box_dims}
 # not fit the per-segment registry above, so they are called once up front and their
 # column is merged into the results below.
 timeseries_registry = {'end_to_end': e2e_timeseries}
-
-# Which of those to run. Drop a name to skip its trajectory pass entirely.
-list_timeseries = ['end_to_end']
 
 # Per-case scalars: one number describing this simulation, not a timeseries. They are
 # written as root attributes of the output file so a later script comparing cases can
@@ -102,32 +121,29 @@ list_timeseries = ['end_to_end']
 # control parameter is specific to this project's directory layout and conventions, and
 # would not mean anything to someone else using the module.
 #
-# Each entry is a function of `context`, a dictionary assembled below holding box,
-# indices, n_frames and the case directory. Edit or add freely.
-user_quantities = {
-    # Backbone beads per unit interfacial area. The C selection is the backbone, so its
-    # segment count times its segment length is the total number of backbone beads, and
-    # a slab in a periodic box presents two interfaces of area Lx * Ly.
-    'surface_concentration':
-        lambda context: (context['indices']['C'].size
-                         / (2.0 * context['box'][0] * context['box'][1])),
-}
-
-indices = idx_selection(input_file, list_bead_types, list_length_of_polymer_segments) # Retrieve indices of polymer segments of interest from select_positions.py
+# Each entry is configured in analysis_config.py.
+indices = (idx_selection(config.trajectory_file, config.list_bead_types,
+                         config.list_length_of_polymer_segments)
+           if config.run_structural else {})
 
 # The per-case scalars, evaluated now that indices and the box are known.
 context = {'box': box_dims, 'indices': indices, 'n_frames': n_frames,
            'case': os.path.basename(os.path.abspath('.'))}
-scalars = {name: float(function(context)) for name, function in user_quantities.items()}
+scalars = ({name: float(function(context))
+            for name, function in config.user_quantities.items()}
+           if config.run_structural else {})
 for name, value in scalars.items():
     print(f"  {name} = {value:.6g}")
 
-eigs, vecs, steps = gtensor_timeseries(polymer_system, indices, box_dims) # Retrieve gyration tensor eigenvalues for each segment of interest from timeseries.py
+if config.run_structural:
+    eigs, vecs, steps = gtensor_timeseries(polymer_system, indices, box_dims) # Retrieve gyration tensor eigenvalues for each segment of interest from timeseries.py
+else:
+    eigs, vecs, steps = {}, {}, np.array([])
 
 # Each of these does its own pass over the trajectory, so only the requested ones run.
 # The steps are discarded because gtensor_timeseries already returned the same array.
 precomputed = {}
-for name in list_timeseries:
+for name in (config.list_timeseries if config.run_structural else []):
     precomputed[name], _ = timeseries_registry[name](polymer_system, indices, box_dims)
 
 results = {} # Raw per-segment data: results[bead_type][column] is (n_frames, n_segments).
@@ -146,14 +162,14 @@ for bead_type in eigs:
 
     # One output array per column produced by the selected analyses. A single
     # analysis can produce several columns, which is why this walks 'returns'.
-    output_names = [column for name in list_analyses
+    output_names = [column for name in config.list_analyses
                     for column in analysis_registry[name]['returns']]
     quantities = {column: np.zeros((n_frames, number_of_segments))
                   for column in output_names}
 
     for ts in range(n_frames):
         for segment in range(number_of_segments):
-            for name in list_analyses:
+            for name in config.list_analyses:
                 analysis = analysis_registry[name]
 
                 # Build the argument list in the order the function expects, taking
@@ -174,7 +190,7 @@ for bead_type in eigs:
 
     # Merge in the columns that were computed over the whole trajectory. They are
     # already (n_frames, n_segments), so they slot straight in alongside the others.
-    for name in list_timeseries:
+    for name in config.list_timeseries:
         quantities[name] = precomputed[name][bead_type]
 
     # Store per bead type, otherwise each pass overwrites the last.
@@ -223,27 +239,60 @@ for bead_type in eigs:
 # vectorised over the leading axis.
 # -------------------------------------------------------------------------------------
 
-gamma = sm.interfacial_tension(pressure_tensor, box_dims,
-                               normal_axis=2,      # interfaces are normal to z
-                               n_interfaces=2)     # a slab in a periodic box has two
-
 # HOOMD stores the pressure tensor as six components in this order.
 tensor_component_names = ('xx', 'xy', 'xz', 'yy', 'yz', 'zz')
 
 # Registry of thermodynamic quantities, selectable the same way the structural ones
 # are. Each entry is just the series itself, since these are already computed rather
 # than derived per segment.
-thermo_registry = {'potential_energy': potet,
-                   'pressure': pressure,
-                   'interfacial_tension': gamma}
-for position, name in enumerate(tensor_component_names):
-    thermo_registry[f'pressure_tensor_{name}'] = pressure_tensor[:, position]
+thermo_registry = {}
+gamma = None
+if config.run_thermo:
+    # Every named 1-D array is immediately available for analysis. pressure_tensor
+    # is expanded separately because it holds six quantities in one 2-D array.
+    thermo_registry = {
+        name: np.asarray(values)
+        for name, values in thermo_data.items()
+        if name not in ('timestep', 'pressure_tensor')
+    }
 
-# Which of the above to analyse. Drop a name to skip it.
-list_thermo = ['potential_energy', 'pressure', 'interfacial_tension',
-               'pressure_tensor_xx', 'pressure_tensor_yy', 'pressure_tensor_zz']
+    pressure_tensor = thermo_data.get('pressure_tensor')
+    if pressure_tensor is not None:
+        pressure_tensor = np.asarray(pressure_tensor)
+        if pressure_tensor.ndim != 2 or pressure_tensor.shape[1] != 6:
+            raise ValueError("'pressure_tensor' must have shape (n_samples, 6).")
+        for position, name in enumerate(tensor_component_names):
+            thermo_registry[f'pressure_tensor_{name}'] = pressure_tensor[:, position]
 
-thermo_series = {name: thermo_registry[name] for name in list_thermo}
+    for name, values in thermo_registry.items():
+        if values.ndim != 1 or len(values) != len(timestep):
+            raise ValueError(
+                f"Thermodynamic series '{name}' must be one-dimensional and have "
+                f"the same length as 'timestep'.")
+
+    # Interfacial tension additionally needs box dimensions. In thermo-only mode
+    # there is no trajectory from which to read them, so this quantity is omitted.
+    if ('interfacial_tension' not in thermo_registry
+            and pressure_tensor is not None and box_dims is not None):
+        gamma = sm.interfacial_tension(pressure_tensor, box_dims,
+                                       normal_axis=2,
+                                       n_interfaces=2)
+        thermo_registry['interfacial_tension'] = gamma
+    elif ('interfacial_tension' in config.list_thermo
+          and 'interfacial_tension' not in thermo_registry):
+        print("Skipping interfacial_tension: pressure tensor and trajectory box "
+              "dimensions are required.")
+
+    unavailable = [name for name in config.list_thermo
+                   if name not in thermo_registry
+                   and name != 'interfacial_tension']
+    if unavailable:
+        raise ValueError(
+            f"Requested thermodynamic series are unavailable: {unavailable}. "
+            "Add matching names to thermo_input_data or hdf5_dataset_paths.")
+
+thermo_series = {name: thermo_registry[name]
+                 for name in config.list_thermo if name in thermo_registry}
 
 
 # -------------------------------------------------------------------------------------
@@ -261,18 +310,19 @@ thermo_series = {name: thermo_registry[name] for name in list_thermo}
 #   /interfacial_tension   (n_thermo,)   gamma, with the convention in its attributes
 # -------------------------------------------------------------------------------------
 
-with h5py.File(gamma_output_file, 'w') as gamma_file:
-    gamma_file.attrs['source_log'] = hdf5_input_file
-    gamma_file.attrs['formula'] = '(L_n / n_interfaces) * (P_nn - (P_t1t1 + P_t2t2) / 2)'
-    gamma_file.attrs['normal_axis'] = 2
-    gamma_file.attrs['n_interfaces'] = 2
-    gamma_file.attrs['box'] = box_dims
-    gamma_file.attrs['source'] = 'soft_matter.interfacial_tension, via equilibration_check.py'
+if gamma is not None:
+    with h5py.File(config.gamma_output_file, 'w') as gamma_file:
+        gamma_file.attrs['source_log'] = thermo_source
+        gamma_file.attrs['formula'] = '(L_n / n_interfaces) * (P_nn - (P_t1t1 + P_t2t2) / 2)'
+        gamma_file.attrs['normal_axis'] = 2
+        gamma_file.attrs['n_interfaces'] = 2
+        gamma_file.attrs['box'] = box_dims
+        gamma_file.attrs['source'] = 'soft_matter.interfacial_tension, via equilibration_check.py'
 
-    gamma_file.create_dataset('timestep', data=timestep)
-    gamma_file.create_dataset('interfacial_tension', data=gamma)
+        gamma_file.create_dataset('timestep', data=timestep)
+        gamma_file.create_dataset('interfacial_tension', data=gamma)
 
-print(f"wrote {gamma_output_file}")
+    print(f"wrote {config.gamma_output_file}")
 
 
 
@@ -317,7 +367,8 @@ def analyse_series(one_series, scale, nskip=1):
 
     start_offset = offset(t0)
 
-    if fix_uncut_transients and start_offset > start_offset_threshold:
+    if (config.fix_uncut_transients
+            and start_offset > config.start_offset_threshold):
         floor = transient_end(one_series, scale)
         if floor > t0:
             t0 = floor
@@ -332,7 +383,8 @@ def analyse_series(one_series, scale, nskip=1):
 
 equilibration = {}  # equilibration[bead_type][column] = {'t0':..., 'g':..., 'neff':...}
 
-sampling_period = steps[1] - steps[0]  # MD steps between trajectory frames
+sampling_period = (steps[1] - steps[0]
+                   if config.run_structural else None)  # MD steps between trajectory frames
 
 print()
 print(f"{'bead type':>9} {'quantity':>17} {'t0':>5} {'t0 (steps)':>12} "
@@ -371,12 +423,13 @@ for bead_type in series:
 # sparsifies the search to every 100th index. That costs a little resolution in t0 and
 # nothing in accuracy.
 thermo_nskip = 100
-thermo_sampling_period = timestep[1] - timestep[0]
+thermo_sampling_period = (timestep[1] - timestep[0]
+                          if config.run_thermo else None)
 n_thermo = len(timestep)
 
 equilibration['thermo'] = {}
 
-for column, one_series in (thermo_series.items() if run_thermo else []):
+for column, one_series in (thermo_series.items() if config.run_thermo else []):
     # No spread across segments exists for these, so the production standard deviation
     # stands in as the scale of a normal fluctuation.
     t0, g, neff, start_offset = analyse_series(
@@ -419,49 +472,51 @@ for column, one_series in (thermo_series.items() if run_thermo else []):
 # -------------------------------------------------------------------------------------
 
 
-with h5py.File(output_file, 'w') as out:
-    # Enough context to know what produced this file without going back to the script.
-    out.attrs['source_trajectory'] = 'polymer_beads.gsd'
-    out.attrs['n_frames'] = n_frames
-    out.attrs['sampling_period'] = sampling_period
-    out.attrs['bead_types'] = list_bead_types
-    out.attrs['segment_lengths'] = list_length_of_polymer_segments
+if config.run_structural:
+    with h5py.File(config.output_file, 'w') as out:
+        # Enough context to know what produced this file without going back to the script.
+        out.attrs['source_trajectory'] = config.trajectory_file
+        out.attrs['n_frames'] = n_frames
+        out.attrs['sampling_period'] = sampling_period
+        out.attrs['bead_types'] = config.list_bead_types
+        out.attrs['segment_lengths'] = config.list_length_of_polymer_segments
 
-    # Per-case scalars from user_quantities, one value describing this simulation.
-    for name, value in scalars.items():
-        out.attrs[name] = value
+        # Per-case scalars from user_quantities, one value describing this simulation.
+        for name, value in scalars.items():
+            out.attrs[name] = value
 
-    out.create_dataset('steps', data=steps)
+        out.create_dataset('steps', data=steps)
 
-    # Thermodynamic series live on their own clock, so they carry their own steps axis
-    # under the same group rather than sharing /steps.
-    if run_thermo:
-        out.create_dataset('thermo/timestep', data=timestep)
-        for column, one_series in thermo_series.items():
-            dataset = out.create_dataset(f'thermo/{column}', data=one_series)
-            for key, value in equilibration['thermo'][column].items():
-                dataset.attrs[key] = value
+        # Thermodynamic series live on their own clock, so they carry their own steps
+        # axis under the same group rather than sharing /steps.
+        if config.run_thermo:
+            out.create_dataset('thermo/timestep', data=timestep)
+            for column, one_series in thermo_series.items():
+                dataset = out.create_dataset(f'thermo/{column}', data=one_series)
+                for key, value in equilibration['thermo'][column].items():
+                    dataset.attrs[key] = value
 
-    for bead_type in series:
-        out.create_group(f'series/{bead_type}')
-        for column, one_series in series[bead_type].items():
-            dataset = out.create_dataset(f'series/{bead_type}/{column}', data=one_series)
-            # Equilibration results attached to the series they were computed from.
-            for key, value in equilibration[bead_type][column].items():
-                dataset.attrs[key] = value
+        for bead_type in series:
+            out.create_group(f'series/{bead_type}')
+            for column, one_series in series[bead_type].items():
+                dataset = out.create_dataset(
+                    f'series/{bead_type}/{column}', data=one_series)
+                # Equilibration results attached to the series they were computed from.
+                for key, value in equilibration[bead_type][column].items():
+                    dataset.attrs[key] = value
 
-            out.create_dataset(f'spread/{bead_type}/{column}',
-                               data=spread[bead_type][column])
+                out.create_dataset(f'spread/{bead_type}/{column}',
+                                   data=spread[bead_type][column])
 
-            if save_raw_segments:
-                # Compressed because these are the large arrays, e.g. 500 x 2400
-                # for every sidechain quantity.
-                out.create_dataset(f'segments/{bead_type}/{column}',
-                                   data=results[bead_type][column],
-                                   compression='gzip', compression_opts=4)
+                if config.save_raw_segments:
+                    # Compressed because these are the large arrays, e.g. 500 x 2400
+                    # for every sidechain quantity.
+                    out.create_dataset(f'segments/{bead_type}/{column}',
+                                       data=results[bead_type][column],
+                                       compression='gzip', compression_opts=4)
 
-print()
-print(f"wrote {output_file}")
+    print()
+    print(f"wrote {config.output_file}")
 
 
 # -------------------------------------------------------------------------------------
@@ -478,22 +533,24 @@ print(f"wrote {output_file}")
 #   blue dashes   - the mean over those independent samples
 # -------------------------------------------------------------------------------------
 
-if make_plots:
-    os.makedirs(plot_folder, exist_ok=True)
+if config.make_plots:
+    os.makedirs(config.plot_folder, exist_ok=True)
 
     # Structural and thermodynamic series are plotted by the same code. They differ only
     # in their steps axis and in whether a within-frame spread exists, so both are
-    # gathered into one list of (group, column, series, steps, spread) and drawn once.
+    # gathered into one list of (group, column, series, x-axis, spread, x-label) and
+    # drawn once.
     to_plot = []
     for bead_type in series:
         for column, one_series in series[bead_type].items():
             to_plot.append((bead_type, column, one_series, steps,
-                            spread[bead_type][column]))
-    if run_thermo:
+                            spread[bead_type][column], 'Timestep'))
+    if config.run_thermo:
         for column, one_series in thermo_series.items():
-            to_plot.append(('thermo', column, one_series, timestep, None))
+            to_plot.append(('thermo', column, one_series, timestep, None,
+                            thermo_x_axis_label))
 
-    for bead_type, column, one_series, x_axis, error in to_plot:
+    for bead_type, column, one_series, x_axis, error, x_axis_label in to_plot:
             t0 = equilibration[bead_type][column]['t0']
             g = equilibration[bead_type][column]['g']
             neff = equilibration[bead_type][column]['neff']
@@ -525,7 +582,7 @@ if make_plots:
             ax.axhline(mean, color='navy', linestyle='--', linewidth=1.0,
                        label=f'production mean = {mean:.4g}')
 
-            ax.set_xlabel('Timestep')
+            ax.set_xlabel(x_axis_label)
             ax.set_ylabel(column)
             ax.set_title(f'{bead_type} - {column}   (g = {g:.2f}, Neff = {neff:.1f})')
             ax.legend(fontsize=8, loc='best')
@@ -549,7 +606,8 @@ if make_plots:
                         weight='bold', va='top')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(plot_folder, f'{bead_type}_{column}.png'), dpi=150)
+            plt.savefig(os.path.join(config.plot_folder,
+                                     f'{bead_type}_{column}.png'), dpi=150)
             plt.close(fig)
 
-    print(f"wrote {len(to_plot)} figures to {plot_folder}/")
+    print(f"wrote {len(to_plot)} figures to {config.plot_folder}/")
